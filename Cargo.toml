@@ -1,0 +1,15 @@
+[package]
+name = "bjorst-resend"
+version = "0.1.0"
+edition = "2021"
+authors = ["Bjorst Engineering <engineering@bjorst.com>"]
+license = "MIT"
+description = "Thin async Resend email client for Bjorst services"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
