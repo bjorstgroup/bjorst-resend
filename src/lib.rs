@@ -28,6 +28,9 @@
 //! # }
 //! ```
 
+#[cfg(feature = "webhook")]
+pub mod webhook;
+
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
