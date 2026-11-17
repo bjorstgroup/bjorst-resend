@@ -22,6 +22,7 @@
 //!         subject: "Welcome",
 //!         text: Some("Thanks for signing up"),
 //!         html: Some("<p>Thanks for signing up</p>"),
+//!         attachments: &[],
 //!     })
 //!     .await?;
 //! # Ok(())
@@ -58,6 +59,23 @@ pub enum EmailError {
     /// a round trip.
     #[error("resend: message has neither a text nor an HTML body")]
     EmptyBody,
+    /// An attachment's file name is empty or is not a bare file name.
+    ///
+    /// The name is shown to the reader and written by their mail client, so a
+    /// path or a control character in it is refused here.
+    #[error("resend: attachment file name {0:?} is not a plain file name")]
+    BadAttachmentName(String),
+}
+
+/// A file sent with a message.
+#[derive(Debug, Clone, Copy)]
+pub struct Attachment<'a> {
+    /// The name the reader sees, for example `invoice.pdf`. A bare file name.
+    pub filename: &'a str,
+    /// The media type, for example `application/pdf`.
+    pub content_type: &'a str,
+    /// The file's bytes. Resend limits a message to 40 MB after encoding.
+    pub content: &'a [u8],
 }
 
 /// A message to send.
@@ -76,6 +94,8 @@ pub struct Email<'a> {
     pub text: Option<&'a str>,
     /// The HTML body, if any.
     pub html: Option<&'a str>,
+    /// Files to attach; empty for none.
+    pub attachments: &'a [Attachment<'a>],
 }
 
 /// What Resend accepted.
@@ -107,6 +127,38 @@ struct ResendPayload<'a> {
     text: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     html: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<ResendAttachment<'a>>,
+}
+
+/// One entry of the request's `attachments`: the content is base64.
+#[derive(Serialize)]
+struct ResendAttachment<'a> {
+    filename: &'a str,
+    content: String,
+    content_type: &'a str,
+}
+
+fn encode_attachments<'a>(
+    attachments: &'a [Attachment<'a>],
+) -> Result<Vec<ResendAttachment<'a>>, EmailError> {
+    use base64::Engine as _;
+    attachments
+        .iter()
+        .map(|a| {
+            let plain = !a.filename.trim().is_empty()
+                && !a.filename.contains(['/', '\\'])
+                && !a.filename.chars().any(char::is_control);
+            if !plain {
+                return Err(EmailError::BadAttachmentName(a.filename.to_owned()));
+            }
+            Ok(ResendAttachment {
+                filename: a.filename,
+                content: base64::engine::general_purpose::STANDARD.encode(a.content),
+                content_type: a.content_type,
+            })
+        })
+        .collect()
 }
 
 impl EmailClient {
@@ -132,6 +184,7 @@ impl EmailClient {
             subject,
             text: Some(text),
             html: None,
+            attachments: &[],
         })
         .await
     }
@@ -140,12 +193,14 @@ impl EmailClient {
     ///
     /// # Errors
     /// Returns [`EmailError::EmptyBody`] when neither body is set,
-    /// [`EmailError::Request`] when the HTTP request fails, or
+    /// [`EmailError::BadAttachmentName`] for an attachment name that is not a
+    /// bare file name, [`EmailError::Request`] when the HTTP request fails, or
     /// [`EmailError::Api`] when Resend responds with a non-success status.
     pub async fn send_email(&self, email: Email<'_>) -> Result<SentEmail, EmailError> {
         if email.text.is_none() && email.html.is_none() {
             return Err(EmailError::EmptyBody);
         }
+        let attachments = encode_attachments(email.attachments)?;
 
         let resp = self
             .client
@@ -157,6 +212,7 @@ impl EmailClient {
                 subject: email.subject,
                 text: email.text,
                 html: email.html,
+                attachments,
             })
             .send()
             .await?;
@@ -183,6 +239,7 @@ mod tests {
             subject: "Hi",
             text: Some("Body"),
             html: None,
+            attachments: Vec::new(),
         })
         .unwrap();
         assert_eq!(
@@ -207,6 +264,7 @@ mod tests {
             subject: "Hi",
             text: None,
             html: Some("<p>Body</p>"),
+            attachments: Vec::new(),
         })
         .unwrap();
         assert_eq!(
@@ -229,6 +287,7 @@ mod tests {
             subject: "Hi",
             text: Some("Body"),
             html: Some("<p>Body</p>"),
+            attachments: Vec::new(),
         })
         .unwrap();
         assert_eq!(json["text"], "Body");
@@ -246,6 +305,7 @@ mod tests {
                 subject: "Hi",
                 text: None,
                 html: None,
+                attachments: &[],
             })
             .await
             .expect_err("a bodyless message must be refused");
@@ -272,5 +332,67 @@ mod tests {
             err.to_string(),
             "resend: API returned 422 Unprocessable Entity: invalid sender"
         );
+    }
+
+    #[test]
+    fn an_attachment_is_sent_as_base64_with_its_name_and_type() {
+        let files = [Attachment {
+            filename: "invoice.pdf",
+            content_type: "application/pdf",
+            content: b"%PDF-1.7",
+        }];
+        let json = serde_json::to_value(ResendPayload {
+            from: "noreply@x.app",
+            to: ["user@x.app"],
+            subject: "Hi",
+            text: Some("Body"),
+            html: None,
+            attachments: encode_attachments(&files).unwrap(),
+        })
+        .unwrap();
+        assert_eq!(
+            json["attachments"],
+            serde_json::json!([{
+                "filename": "invoice.pdf",
+                "content": "JVBERi0xLjc=",
+                "content_type": "application/pdf",
+            }])
+        );
+    }
+
+    #[test]
+    fn a_message_without_attachments_omits_the_field() {
+        let json = serde_json::to_value(ResendPayload {
+            from: "noreply@x.app",
+            to: ["user@x.app"],
+            subject: "Hi",
+            text: Some("Body"),
+            html: None,
+            attachments: Vec::new(),
+        })
+        .unwrap();
+        assert!(json.get("attachments").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_attachment_name_that_is_a_path_is_refused_before_the_request() {
+        let client = EmailClient::new("re_test", "noreply@x.app");
+        for name in ["", "../x.pdf", "a\\b.pdf", "a\nb.pdf"] {
+            let err = client
+                .send_email(Email {
+                    to: "user@x.app",
+                    subject: "Hi",
+                    text: Some("Body"),
+                    html: None,
+                    attachments: &[Attachment {
+                        filename: name,
+                        content_type: "application/pdf",
+                        content: b"x",
+                    }],
+                })
+                .await
+                .expect_err("a path-like name must be refused");
+            assert!(matches!(err, EmailError::BadAttachmentName(_)), "{name:?}");
+        }
     }
 }
